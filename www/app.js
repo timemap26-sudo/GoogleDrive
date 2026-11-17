@@ -36,10 +36,16 @@
   const MIN_DWELL = 220;         // 每張街景至少停留的時間，避免畫面還沒載好就跳下一張
   const MAX_FORWARD_ANGLE = 80;  // 手動前進時可接受的道路夾角
   const STEP_TIMEOUT = 3000;     // 等待街景載入的逾時
+  // 連續感：三層全景輪替。下一張先在隱藏層預載，換張時交叉淡入；
+  // 前進時鏡頭持續緩慢推近（模擬往前開），淡入的新照片剛好接上推近後的畫面。
+  const BASE_ZOOM = 0;
+  const DOLLY_ZOOM = 0.42;       // 每前進一張推近的 zoom 量（約等於往前 10 公尺的放大）
+  const FADE_MIN = 220, FADE_MAX = 520, JUMP_FADE = 600; // 交叉淡入時間（毫秒）
+  const TILE_GRACE = 140;        // 剛載好資料時多等一下，讓影像圖磚載入再淡入
 
   const $ = (id) => document.getElementById(id);
   const els = {
-    pano: $('pano'), minimap: $('minimap'), minimapWrap: $('minimapWrap'), status: $('status'),
+    layers: [$('panoA'), $('panoB'), $('panoC')], minimap: $('minimap'), minimapWrap: $('minimapWrap'), status: $('status'),
     speed: $('speedValue'), gear: $('gear'), needle: $('needle'), headingText: $('headingText'),
     help: $('help'), autoBtn: $('autoBtn'),
     keyDialog: $('keyDialog'), keyForm: $('keyForm'), keyInput: $('keyInput'),
@@ -47,7 +53,8 @@
   };
 
   const state = {
-    panorama: null, map: null, marker: null, svService: null, geocoder: null,
+    panorama: null, layers: [], front: null, preload: null, fading: null, fadeUntil: 0,
+    pending: null, pendingFade: 0, map: null, marker: null, svService: null, geocoder: null,
     heading: CFG.startHeading || 0,   // 車頭（邏輯）方向
     cam: CFG.startHeading || 0,       // 鏡頭實際顯示的方向，平滑跟隨 heading
     camPitch: 0,
@@ -129,9 +136,9 @@
     state.svService = new g.StreetViewService();
     state.geocoder = new g.Geocoder();
 
-    state.panorama = new g.StreetViewPanorama(els.pano, {
+    const panoOpts = {
       pov: { heading: state.heading, pitch: 0 },
-      zoom: 0,
+      zoom: BASE_ZOOM,
       disableDefaultUI: true,
       showRoadLabels: true,
       linksControl: true,
@@ -142,7 +149,11 @@
       keyboardShortcuts: false,
       motionTracking: false,
       motionTrackingControl: false,
-    });
+    };
+    state.layers = els.layers.map((el) => makeLayer(el, panoOpts));
+    state.front = state.layers[0];
+    state.preload = state.layers[1];
+    state.panorama = state.front.pano;
 
     state.map = new g.Map(els.minimap, {
       center: CFG.start, zoom: 17, disableDefaultUI: true, gestureHandling: 'none',
@@ -162,18 +173,30 @@
     $('mapType').addEventListener('click', toggleMapType);
     try { if (localStorage.getItem(MAPTYPE_STORAGE) === 'hybrid') toggleMapType(); } catch (_) {}
 
-    state.panorama.addListener('pano_changed', onArrive);
-    state.panorama.addListener('links_changed', onLinks);
-    state.panorama.addListener('position_changed', () => {
-      const p = state.panorama.getPosition();
-      if (!p) return;
-      state.map.panTo(p);
-      state.marker.setPosition(p);
-      try { localStorage.setItem(POS_STORAGE, JSON.stringify({ lat: p.lat(), lng: p.lng(), h: state.heading })); } catch (_) {}
+
+    let start = CFG.start;
+    try {
+      const saved = JSON.parse(localStorage.getItem(POS_STORAGE) || 'null');
+      if (saved && typeof saved.lat === 'number') { start = saved; state.heading = saved.h || 0; }
+    } catch (_) {}
+    jumpTo(start);
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- 全景圖層 ----------
+  function makeLayer(el, opts) {
+    const L = { el, pano: new google.maps.StreetViewPanorama(el, opts), want: null, id: null, readyAt: 0,
+      z: BASE_ZOOM, zApplied: BASE_ZOOM };
+    L.pano.addListener('links_changed', () => {
+      const id = L.pano.getPano();
+      if (id && id === L.want && L.id !== id) { L.id = id; L.readyAt = performance.now(); }
+      if (L === state.front && !state.pending) onLinks();
     });
+    L.pano.addListener('position_changed', () => { if (L === state.front) updatePosition(); });
     // 使用者若用滑鼠拖曳畫面，同步車頭方向
-    state.panorama.addListener('pov_changed', () => {
-      const pov = state.panorama.getPov();
+    L.pano.addListener('pov_changed', () => {
+      if (L !== state.front) return;
+      const pov = L.pano.getPov();
       if (state.lastPovHeading === null || angleDiff(pov.heading, state.lastPovHeading) > 0.5) {
         if (!state.keys.size && !state.auto) {
           state.heading = state.cam = norm(pov.heading);
@@ -184,14 +207,75 @@
       }
       state.camPitch = pov.pitch;
     });
+    return L;
+  }
 
-    let start = CFG.start;
-    try {
-      const saved = JSON.parse(localStorage.getItem(POS_STORAGE) || 'null');
-      if (saved && typeof saved.lat === 'number') { start = saved; state.heading = saved.h || 0; }
-    } catch (_) {}
-    jumpTo(start);
-    requestAnimationFrame(loop);
+  function setZoom(L, z) {
+    L.z = z;
+    if (Math.abs(L.zApplied - z) > 0.002) { L.zApplied = z; L.pano.setZoom(z); }
+  }
+
+  // 在預載層載入指定的街景（不顯示）
+  function loadInto(L, id) {
+    if (L.want === id) return;
+    L.want = id; L.id = null; L.readyAt = 0;
+    L.pano.setPov({ heading: state.cam, pitch: state.camPitch });
+    setZoom(L, BASE_ZOOM);
+    L.pano.setPano(id);
+    L.pano.setVisible(true);
+  }
+
+  // 要求前往某張街景：在預載層載好後交叉淡入
+  function goTo(id, fade) {
+    state.busy = true;
+    state.busySince = performance.now();
+    state.pending = id;
+    state.pendingFade = fade;
+    loadInto(state.preload, id);
+  }
+
+  function swap(now) {
+    const next = state.preload, prev = state.front;
+    // 上一次還沒淡完的圖層直接收起來
+    const spare = state.fading || state.layers.find((l) => l !== next && l !== prev);
+    spare.el.style.transition = 'none';
+    spare.el.style.opacity = '0';
+    spare.el.style.zIndex = '1';
+
+    prev.el.style.zIndex = '2';
+    next.el.style.zIndex = '3';
+    setZoom(next, BASE_ZOOM);
+    next.pano.setPov({ heading: state.cam, pitch: state.camPitch });
+    next.el.style.transition = `opacity ${state.pendingFade}ms linear`;
+    next.el.style.opacity = '1';
+
+    state.front = next;
+    state.panorama = next.pano;
+    state.fading = prev;
+    state.fadeUntil = now + state.pendingFade;
+    state.preload = spare;
+    state.pending = null;
+    state.lastPovHeading = norm(state.cam);
+    onArrive();
+    updatePosition();
+  }
+
+  function updatePosition() {
+    const p = state.panorama && state.panorama.getPosition();
+    if (!p) return;
+    state.map.panTo(p);
+    state.marker.setPosition(p);
+    try { localStorage.setItem(POS_STORAGE, JSON.stringify({ lat: p.lat(), lng: p.lng(), h: state.heading })); } catch (_) {}
+  }
+
+  // 預先載入「接下來最可能走的」那張街景
+  function predictNext() {
+    if (state.pending) return;
+    const dir = state.lastDir === -1 && !state.auto ? -1 : 1;
+    const want = dir === 1 ? state.heading : state.heading + 180;
+    const r = bestLink(want, state.auto);
+    if (!r || r.diff > (state.auto ? 135 : MAX_FORWARD_ANGLE)) return;
+    loadInto(state.preload, r.link.pano);
   }
 
   // ---------- 找街景 / 跳轉 ----------
@@ -207,7 +291,6 @@
         setStatus('這附近沒有街景，換個地點試試');
         return;
       }
-      state.busy = true; state.busySince = performance.now();
       // 車頭朝向最接近目前方向的道路
       const links = data.links || [];
       if (links.length) {
@@ -215,10 +298,9 @@
         for (const l of links) if (angleDiff(l.heading, state.heading) < angleDiff(best.heading, state.heading)) best = l;
         state.heading = norm(best.heading);
       }
-      state.cam = state.heading; state.turnVel = 0; state.alignTarget = null;
-      state.panorama.setPano(data.location.pano);
-      applyPov(state.cam, 0);
-      state.panorama.setVisible(true);
+      state.cam = state.heading; state.camPitch = 0; state.turnVel = 0; state.alignTarget = null;
+      state.lastDir = 0;
+      goTo(data.location.pano, JUMP_FADE);
     });
   }
 
@@ -239,7 +321,9 @@
   // ---------- 開車核心 ----------
   function applyPov(heading, pitch) {
     state.lastPovHeading = norm(heading);
-    state.panorama.setPov({ heading: state.lastPovHeading, pitch });
+    const pov = { heading: state.lastPovHeading, pitch };
+    state.panorama.setPov(pov);
+    if (state.fading) state.fading.pano.setPov(pov); // 淡出中的畫面也一起轉，兩張才對得上
   }
 
   function onArrive() {
@@ -277,11 +361,9 @@
     // 自動駕駛在路口時，直接轉向新的道路
     if (state.auto && r.diff > 30) state.heading = norm(r.link.heading);
 
-    state.busy = true;
-    state.busySince = now;
     state.lastStep = now;
     state.lastDir = dir;
-    state.panorama.setPano(r.link.pano);
+    goTo(r.link.pano, Math.max(FADE_MIN, Math.min(FADE_MAX, GEARS[state.gear].interval * 0.6)));
     if (navigator.vibrate) navigator.vibrate(8);
     setStatus(r.link.description || (dir === 1 ? '前進中' : '倒車中'));
   }
@@ -329,6 +411,35 @@
       if (fwd && !back) moving = 1; else if (back && !fwd) moving = -1;
       if (moving && now - state.lastStep >= (moving === -1 ? interval * 1.4 : interval)
           && now - state.arrivedAt >= MIN_DWELL) step(moving);
+
+      // 預載層準備好就交叉淡入（逾時也直接換，避免卡住）
+      if (state.pending) {
+        const P = state.preload;
+        const ready = P.id === state.pending && now - P.readyAt >= TILE_GRACE;
+        if (ready || now - state.busySince > STEP_TIMEOUT) swap(now);
+      }
+      if (state.fading && now >= state.fadeUntil) {
+        const F = state.fading;
+        F.el.style.transition = 'none';
+        F.el.style.opacity = '0';
+        F.el.style.zIndex = '1';
+        setZoom(F, BASE_ZOOM);
+        state.fading = null;
+      }
+
+      // 前進時鏡頭持續推近，看起來像一直往前開，而不是一格一格跳
+      const dollyRate = DOLLY_ZOOM / (interval / 1000);
+      if (moving === 1) {
+        setZoom(state.front, Math.min(BASE_ZOOM + DOLLY_ZOOM * 1.2, state.front.z + dollyRate * dt));
+      } else if (state.front.z !== BASE_ZOOM) {
+        const z = state.front.z + (BASE_ZOOM - state.front.z) * ease(moving ? 6 : 1.5, dt);
+        setZoom(state.front, Math.abs(z - BASE_ZOOM) < 0.003 ? BASE_ZOOM : z);
+      }
+      if (state.fading && state.lastDir === 1) {
+        setZoom(state.fading, Math.min(BASE_ZOOM + DOLLY_ZOOM * 2.2, state.fading.z + dollyRate * dt));
+      }
+
+      if (!state.pending && state.front.id) predictNext();
 
       // 儀表
       const target = moving ? (METERS_PER_STEP / ((moving === -1 ? interval * 1.4 : interval) / 1000)) * 3.6 : 0;
