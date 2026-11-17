@@ -21,13 +21,7 @@
   const MAPTYPE_STORAGE = 'streetDrive.mapType';
 
   // 每檔位的定速（km/h）。依「實際照片間距」決定何時換下一張，所以速度固定，不會忽快忽慢。
-  const GEARS = [
-    { name: '1', kmh: 25 },
-    { name: '2', kmh: 35 },
-    { name: '3', kmh: 50 },
-    { name: '4', kmh: 65 },
-    { name: '5', kmh: 80 },
-  ];
+  const GEARS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50].map((kmh, i) => ({ name: String(i + 1), kmh }));
   const DEFAULT_STEP_M = 10;     // 還不知道下一張位置時，假設的照片間距
   const REVERSE_FACTOR = 0.6;    // 倒車速度比例
   const TURN_RATE = 70;          // 度/秒
@@ -74,7 +68,7 @@
     alignTarget: null,        // 道路方向，車頭會慢慢對齊
     keys: new Set(),
     drag: null,               // 滑鼠/觸控拖曳中的指標
-    gear: 2,
+    gear: 4,
     lite: false,              // 單圖層模式（裝置 WebGL 記憶體不足時自動切換）
     auto: false,
     cruise: false,            // 定速巡航：不用按住 ↑ 也會持續前進，方向自己控制
