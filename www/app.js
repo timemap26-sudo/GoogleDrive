@@ -181,12 +181,27 @@
     } catch (_) {}
     jumpTo(start);
     requestAnimationFrame(loop);
+    setInterval(healthCheck, 2000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(healthCheck, 300); });
   }
 
   // ---------- 全景圖層 ----------
   function makeLayer(el, opts) {
-    const L = { el, pano: new google.maps.StreetViewPanorama(el, opts), want: null, id: null, readyAt: 0,
-      z: BASE_ZOOM, zApplied: BASE_ZOOM };
+    const L = { el, opts, pano: null, want: null, id: null, readyAt: 0, z: BASE_ZOOM, zApplied: BASE_ZOOM };
+    buildPano(L);
+    // WebGL 畫布失效（手機記憶體不足、切到背景再回來）時街景會整片變黑，重建該圖層
+    el.addEventListener('webglcontextlost', () => rebuildLayer(L), true);
+    return L;
+  }
+
+  function buildPano(L) {
+    if (L.pano) { google.maps.event.clearInstanceListeners(L.pano); L.pano.setVisible(false); }
+    L.el.textContent = '';
+    const host = document.createElement('div');
+    host.style.cssText = 'position:absolute;inset:0';
+    L.el.appendChild(host);
+    L.pano = new google.maps.StreetViewPanorama(host, L.opts);
+    L.zApplied = L.z = BASE_ZOOM;
     L.pano.addListener('links_changed', () => {
       const id = L.pano.getPano();
       if (id && id === L.want && L.id !== id) { L.id = id; L.readyAt = performance.now(); }
@@ -207,12 +222,45 @@
       }
       state.camPitch = pov.pitch;
     });
-    return L;
+  }
+
+  function rebuildLayer(L) {
+    if (L.rebuilding) return;
+    L.rebuilding = true;
+    setTimeout(() => {
+      L.rebuilding = false;
+      const id = L.id || L.want;
+      buildPano(L);
+      L.want = null; L.id = null; L.readyAt = 0;
+      if (L === state.front) {
+        state.panorama = L.pano;
+        if (id) loadInto(L, id);
+      }
+    }, 50);
+  }
+
+  function contextLost(L) {
+    for (const c of L.el.querySelectorAll('canvas')) {
+      let gl = null;
+      try { gl = c.getContext('webgl2') || c.getContext('webgl'); } catch (_) {}
+      if (gl && gl.isContextLost()) return true;
+    }
+    return false;
+  }
+
+  function healthCheck() {
+    if (!state.layers.length || document.hidden) return;
+    for (const L of state.layers) if (contextLost(L)) rebuildLayer(L);
+    // 保險：目前顯示的圖層一定要是可見的
+    const F = state.front;
+    if (F && !state.pending && F.el.style.opacity !== '1') {
+      F.el.style.transition = 'none'; F.el.style.opacity = '1'; F.el.style.zIndex = '3';
+    }
   }
 
   function setZoom(L, z) {
     L.z = z;
-    if (Math.abs(L.zApplied - z) > 0.002) { L.zApplied = z; L.pano.setZoom(z); }
+    if (Math.abs(L.zApplied - z) > 0.02 || (z === BASE_ZOOM && L.zApplied !== BASE_ZOOM)) { L.zApplied = z; L.pano.setZoom(z); }
   }
 
   // 在預載層載入指定的街景（不顯示）
@@ -258,6 +306,16 @@
     state.lastPovHeading = norm(state.cam);
     onArrive();
     updatePosition();
+  }
+
+  function abortPending(now) {
+    const P = state.preload;
+    state.pending = null;
+    state.busy = false;
+    state.lastStep = now;
+    P.want = null; P.id = null;
+    if (contextLost(P)) rebuildLayer(P);
+    setStatus('街景載入逾時，重試中…');
   }
 
   function updatePosition() {
@@ -416,7 +474,11 @@
       if (state.pending) {
         const P = state.preload;
         const ready = P.id === state.pending && now - P.readyAt >= TILE_GRACE;
-        if (ready || now - state.busySince > STEP_TIMEOUT) swap(now);
+        if (ready) swap(now);
+        else if (now - state.busySince > STEP_TIMEOUT) {
+          if (!state.front.id) swap(now);       // 還沒有任何畫面（剛開啟）：照樣顯示
+          else abortPending(now);               // 已有畫面：保留目前畫面，不換成黑的
+        }
       }
       if (state.fading && now >= state.fadeUntil) {
         const F = state.fading;
