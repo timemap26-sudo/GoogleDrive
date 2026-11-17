@@ -1,5 +1,5 @@
 // 只快取 App 外殼；Google 街景資料一律走網路。
-const CACHE = 'street-drive-v5';
+const CACHE = 'street-drive-v6';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'config.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
 
