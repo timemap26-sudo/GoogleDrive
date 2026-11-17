@@ -125,6 +125,8 @@ button:active { filter: brightness(1.3); }
 .side { display: flex; flex-direction: column; gap: 6px; }
 .ctl.small { width: 58px; height: 44px; font-size: 14px; font-weight: 700; }
 #autoBtn.on { background: rgba(244, 63, 94, 0.6); border-color: var(--danger); }
+#cruiseBtn { font-size: 11px; }
+#cruiseBtn.on { background: rgba(34, 197, 94, 0.55); border-color: #22c55e; }
 
 @media (pointer: coarse), (max-width: 760px) {
   #touchControls { display: flex; }
