@@ -25,8 +25,12 @@
     { name: '5', interval: 400 },
   ];
   const METERS_PER_STEP = 10;
-  const TURN_RATE = 75;          // 度/秒
-  const ALIGN_RATE = 2.5;        // 自動對齊道路方向的速度（越大越快）
+  const TURN_RATE = 70;          // 度/秒
+  const TURN_ACCEL = 7;          // 轉向加速/減速的平滑度（越大越快達到全速）
+  const CAM_SMOOTH = 6;          // 鏡頭跟隨車頭的平滑度（越小越柔和）
+  const ALIGN_RATE = 1.6;        // 自動對齊道路方向的速度（越大越快）
+  const ALIGN_DEADBAND = 7;      // 道路方向差在此角度內視為直路，不修正（避免鏡頭左右晃）
+  const MIN_DWELL = 220;         // 每張街景至少停留的時間，避免畫面還沒載好就跳下一張
   const MAX_FORWARD_ANGLE = 80;  // 手動前進時可接受的道路夾角
   const STEP_TIMEOUT = 3000;     // 等待街景載入的逾時
 
@@ -41,7 +45,12 @@
 
   const state = {
     panorama: null, map: null, marker: null, svService: null, geocoder: null,
-    heading: CFG.startHeading || 0,
+    heading: CFG.startHeading || 0,   // 車頭（邏輯）方向
+    cam: CFG.startHeading || 0,       // 鏡頭實際顯示的方向，平滑跟隨 heading
+    camPitch: 0,
+    lastPovHeading: null,             // 最後一次由程式設定的鏡頭方向
+    turnVel: 0,                       // 目前轉向角速度（度/秒）
+    arrivedAt: 0,
     alignTarget: null,        // 道路方向，車頭會慢慢對齊
     keys: new Set(),
     gear: 2,
@@ -52,6 +61,7 @@
     lastDir: 0,               // 1 前進, -1 倒車, 0 停止
     displaySpeed: 0,
     lastFrame: performance.now(),
+    ui: {},                   // 快取儀表顯示值，避免每幀重寫 DOM
   };
 
   // ---------- 工具 ----------
@@ -155,11 +165,16 @@
     });
     // 使用者若用滑鼠拖曳畫面，同步車頭方向
     state.panorama.addListener('pov_changed', () => {
-      const h = state.panorama.getPov().heading;
-      if (angleDiff(h, state.heading) > 0.5 && !state.keys.size && !state.auto) {
-        state.heading = norm(h);
-        state.alignTarget = null;
+      const pov = state.panorama.getPov();
+      if (state.lastPovHeading === null || angleDiff(pov.heading, state.lastPovHeading) > 0.5) {
+        if (!state.keys.size && !state.auto) {
+          state.heading = state.cam = norm(pov.heading);
+          state.alignTarget = null;
+          state.turnVel = 0;
+        }
+        state.lastPovHeading = norm(pov.heading);
       }
+      state.camPitch = pov.pitch;
     });
 
     let start = CFG.start;
@@ -192,8 +207,9 @@
         for (const l of links) if (angleDiff(l.heading, state.heading) < angleDiff(best.heading, state.heading)) best = l;
         state.heading = norm(best.heading);
       }
+      state.cam = state.heading; state.turnVel = 0; state.alignTarget = null;
       state.panorama.setPano(data.location.pano);
-      state.panorama.setPov({ heading: state.heading, pitch: 0 });
+      applyPov(state.cam, 0);
       state.panorama.setVisible(true);
     });
   }
@@ -213,9 +229,15 @@
   });
 
   // ---------- 開車核心 ----------
+  function applyPov(heading, pitch) {
+    state.lastPovHeading = norm(heading);
+    state.panorama.setPov({ heading: state.lastPovHeading, pitch });
+  }
+
   function onArrive() {
     state.busy = false;
-    state.panorama.setPov({ heading: state.heading, pitch: 0 });
+    state.arrivedAt = performance.now();
+    // 不在這裡強制設定鏡頭，交給每幀的平滑跟隨，避免換張時鏡頭突然跳動
     onLinks();
   }
 
@@ -223,9 +245,9 @@
     // 到新的一張街景後，找出「繼續往前」的道路，讓車頭順著彎道慢慢轉過去
     const ref = state.lastDir === -1 ? state.heading + 180 : state.heading;
     const r = bestLink(ref);
-    if (r && r.diff < 50) {
+    if (r && r.diff < 50 && r.diff > ALIGN_DEADBAND) {
       state.alignTarget = state.lastDir === -1 ? norm(r.link.heading + 180) : norm(r.link.heading);
-    } else {
+    } else if (!r || r.diff >= 50) {
       state.alignTarget = null;
     }
     const n = (state.panorama.getLinks() || []).length;
@@ -252,17 +274,12 @@
     state.lastStep = now;
     state.lastDir = dir;
     state.panorama.setPano(r.link.pano);
-    pulse(dir);
+    if (navigator.vibrate) navigator.vibrate(8);
     setStatus(r.link.description || (dir === 1 ? '前進中' : '倒車中'));
   }
 
-  function pulse(dir) {
-    const c = els.pano.classList;
-    c.remove('surge', 'reverse');
-    void els.pano.offsetWidth; // 重新觸發動畫
-    c.add(dir === 1 ? 'surge' : 'reverse');
-    if (navigator.vibrate) navigator.vibrate(8);
-  }
+  const ease = (rate, dt) => 1 - Math.exp(-rate * dt); // 與幀率無關的平滑係數
+  function setText(key, el, v) { if (state.ui[key] !== v) { state.ui[key] = v; el.textContent = v; } }
 
   function loop(now) {
     const dt = Math.min(0.1, (now - state.lastFrame) / 1000);
@@ -274,18 +291,26 @@
       let turn = 0;
       if (k.has('ArrowLeft') || k.has('a')) turn -= 1;
       if (k.has('ArrowRight') || k.has('d')) turn += 1;
-      const prev = state.heading;
-      if (turn) {
-        state.heading = norm(state.heading + turn * TURN_RATE * dt);
-        state.alignTarget = null;
-      } else if (state.alignTarget !== null) {
+      // 轉向速度有加減速，按下/放開時不會突然甩動
+      state.turnVel += (turn * TURN_RATE - state.turnVel) * ease(TURN_ACCEL, dt);
+      if (Math.abs(state.turnVel) < 0.5 && !turn) state.turnVel = 0;
+      if (state.turnVel) {
+        state.heading = norm(state.heading + state.turnVel * dt);
+        if (turn) state.alignTarget = null;
+      }
+      if (!turn && state.alignTarget !== null) {
         const d = signedDiff(state.heading, state.alignTarget);
         if (Math.abs(d) < 0.3) { state.heading = state.alignTarget; state.alignTarget = null; }
-        else state.heading = norm(state.heading + d * Math.min(1, ALIGN_RATE * dt));
+        else state.heading = norm(state.heading + d * ease(ALIGN_RATE, dt));
       }
-      if (state.heading !== prev) {
-        const pov = state.panorama.getPov();
-        state.panorama.setPov({ heading: state.heading, pitch: pov.pitch * 0.9 });
+
+      // 鏡頭平滑跟隨車頭方向；pitch 慢慢回正
+      const cd = signedDiff(state.cam, state.heading);
+      const pitch = Math.abs(state.camPitch) < 0.05 ? 0 : state.camPitch * (1 - ease(3, dt));
+      if (Math.abs(cd) > 0.02 || pitch !== state.camPitch) {
+        state.cam = Math.abs(cd) < 0.02 ? state.heading : norm(state.cam + cd * ease(CAM_SMOOTH, dt));
+        state.camPitch = pitch;
+        applyPov(state.cam, pitch);
       }
 
       // 前進 / 倒車
@@ -294,17 +319,22 @@
       const interval = GEARS[state.gear].interval;
       let moving = 0;
       if (fwd && !back) moving = 1; else if (back && !fwd) moving = -1;
-      if (moving && now - state.lastStep >= (moving === -1 ? interval * 1.4 : interval)) step(moving);
+      if (moving && now - state.lastStep >= (moving === -1 ? interval * 1.4 : interval)
+          && now - state.arrivedAt >= MIN_DWELL) step(moving);
 
       // 儀表
       const target = moving ? (METERS_PER_STEP / ((moving === -1 ? interval * 1.4 : interval) / 1000)) * 3.6 : 0;
       state.displaySpeed += (target - state.displaySpeed) * Math.min(1, dt * 3);
-      els.speed.textContent = Math.round(state.displaySpeed);
-      els.gear.textContent = moving === -1 ? 'R' : (moving ? GEARS[state.gear].name : 'P');
-      els.needle.style.transform = `rotate(${-state.heading}deg)`;
-      els.headingText.textContent = `${Math.round(state.heading)}°`;
+      setText('speed', els.speed, String(Math.round(state.displaySpeed)));
+      setText('gear', els.gear, moving === -1 ? 'R' : (moving ? GEARS[state.gear].name : 'P'));
+      const hdg = Math.round(state.cam) % 360;
+      if (state.ui.hdg !== hdg) {
+        state.ui.hdg = hdg;
+        els.needle.style.transform = `rotate(${-hdg}deg)`;
+        els.headingText.textContent = `${hdg}°`;
+      }
       const icon = state.marker.getIcon();
-      if (Math.abs((icon.rotation || 0) - state.heading) > 1) { icon.rotation = state.heading; state.marker.setIcon(icon); }
+      if (angleDiff(icon.rotation || 0, state.cam) > 2) { icon.rotation = state.cam; state.marker.setIcon(icon); }
     }
     requestAnimationFrame(loop);
   }
