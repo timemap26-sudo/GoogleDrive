@@ -20,28 +20,33 @@
   const POS_STORAGE = 'streetDrive.lastPos';
   const MAPTYPE_STORAGE = 'streetDrive.mapType';
 
-  // 每檔位：多久前進一張街景（毫秒）。街景照片間距約 8~12 公尺。
+  // 每檔位的定速（km/h）。依「實際照片間距」決定何時換下一張，所以速度固定，不會忽快忽慢。
   const GEARS = [
-    { name: '1', interval: 1400 },
-    { name: '2', interval: 1000 },
-    { name: '3', interval: 750 },
-    { name: '4', interval: 550 },
-    { name: '5', interval: 400 },
+    { name: '1', kmh: 25 },
+    { name: '2', kmh: 35 },
+    { name: '3', kmh: 50 },
+    { name: '4', kmh: 65 },
+    { name: '5', kmh: 80 },
   ];
-  const METERS_PER_STEP = 10;
+  const DEFAULT_STEP_M = 10;     // 還不知道下一張位置時，假設的照片間距
+  const MIN_STEP_M = 3, MAX_STEP_M = 25;
+  const REVERSE_FACTOR = 0.6;    // 倒車速度比例
   const TURN_RATE = 70;          // 度/秒
   const TURN_ACCEL = 7;          // 轉向加速/減速的平滑度（越大越快達到全速）
   const CAM_SMOOTH = 6;          // 鏡頭跟隨車頭的平滑度（越小越柔和）
   const ALIGN_RATE = 1.6;        // 自動對齊道路方向的速度（越大越快）
   const ALIGN_DEADBAND = 7;      // 道路方向差在此角度內視為直路，不修正（避免鏡頭左右晃）
-  const MIN_DWELL = 220;         // 每張街景至少停留的時間，避免畫面還沒載好就跳下一張
+  const MIN_DWELL = 150;         // 每張街景至少停留的時間，避免畫面還沒載好就跳下一張
   const MAX_FORWARD_ANGLE = 80;  // 手動前進時可接受的道路夾角
   const STEP_TIMEOUT = 3000;     // 等待街景載入的逾時
   // 連續感：三層全景輪替。下一張先在隱藏層預載，換張時交叉淡入；
   // 前進時鏡頭持續緩慢推近（模擬往前開），淡入的新照片剛好接上推近後的畫面。
-  const BASE_ZOOM = 0;
-  const DOLLY_ZOOM = 0.42;       // 每前進一張推近的 zoom 量（約等於往前 10 公尺的放大）
-  const FADE_MIN = 220, FADE_MAX = 520, JUMP_FADE = 600; // 交叉淡入時間（毫秒）
+  // 畫質：zoom 0 是 180° 超廣角（影像被拉扯、解析度低）；橫向畫面用 zoom 1（90°，跟 Google 預設一樣清楚），
+  // 直向手機用 0.6 保留足夠視野。zoom 越高 Google 會載入越高解析度的圖磚。
+  const baseZoom = () => (window.innerWidth >= window.innerHeight ? 1 : 0.6);
+  let BASE_ZOOM = baseZoom();
+  const DOLLY_PER_M = 0.04;      // 每往前 1 公尺推近的 zoom 量（模擬往前開）
+  const FADE_MIN = 180, FADE_MAX = 500, JUMP_FADE = 600; // 交叉淡入時間（毫秒）
   const TILE_GRACE = 140;        // 剛載好資料時多等一下，讓影像圖磚載入再淡入
   const DRAG_FOV = 100;          // 拖過整個畫面寬度約轉動的角度
   const MAX_PITCH = 80;
@@ -72,7 +77,11 @@
     auto: false,
     busy: false,
     busySince: 0,
-    lastStep: 0,
+    odo: 0,                   // 離開目前這張照片後「虛擬行駛」的公尺數（定速累積）
+    odoDir: 0,
+    stepDist: 0,              // 正在前往的那張照片距離（公尺）
+    speed: 0,                 // 目前車速（公尺/秒）
+    blockedUntil: 0,          // 前方沒路時，暫停重試
     lastDir: 0,               // 1 前進, -1 倒車, 0 停止
     displaySpeed: 0,
     lastFrame: performance.now(),
@@ -82,6 +91,13 @@
   // ---------- 工具 ----------
   const norm = (h) => ((h % 360) + 360) % 360;
   const angleDiff = (a, b) => { const d = Math.abs(norm(a) - norm(b)) % 360; return d > 180 ? 360 - d : d; };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  function distM(a, b) { // 兩個 LatLng 的距離（公尺）
+    const R = 6371000, r = Math.PI / 180;
+    const dLat = (b.lat() - a.lat()) * r, dLng = (b.lng() - a.lng()) * r;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat() * r) * Math.cos(b.lat() * r) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
   const signedDiff = (from, to) => { let d = norm(to) - norm(from); if (d > 180) d -= 360; if (d < -180) d += 360; return d; };
   const setStatus = (t) => { els.status.textContent = t; };
 
@@ -316,7 +332,7 @@
 
   function setZoom(L, z) {
     L.z = z;
-    if (Math.abs(L.zApplied - z) > 0.02 || (z === BASE_ZOOM && L.zApplied !== BASE_ZOOM)) { L.zApplied = z; L.pano.setZoom(z); }
+    if (Math.abs(L.zApplied - z) > 0.004 || (z === BASE_ZOOM && L.zApplied !== BASE_ZOOM)) { L.zApplied = z; L.pano.setZoom(z); }
   }
 
   // 在預載層載入指定的街景（不顯示）
@@ -326,6 +342,7 @@
     L.want = id; L.id = null; L.readyAt = 0; L.failed = null;
     if (L !== state.front) {
       L.pano.setPov({ heading: state.cam, pitch: state.camPitch });
+      L.povH = state.cam; L.povP = state.camPitch;
       setZoom(L, BASE_ZOOM);
     }
     if (L.prevId === id && L.pano.getStatus() === 'OK') {
@@ -350,6 +367,7 @@
     if (state.lite) {
       // 單圖層：新照片就載在目前的圖層上，不需要換層
       state.pending = null;
+      carryOdo();
       showLayer(state.front);
       onArrive();
       updatePosition();
@@ -364,7 +382,9 @@
 
     prev.el.style.zIndex = '2';
     next.el.style.zIndex = '3';
-    setZoom(next, BASE_ZOOM);
+    carryOdo();
+    // 多走的距離接續到新照片上，推近的畫面不會倒退
+    setZoom(next, BASE_ZOOM + (state.lastDir === 1 ? DOLLY_PER_M * state.odo : 0));
     next.pano.setPov({ heading: state.cam, pitch: state.camPitch });
     next.el.style.transition = `opacity ${state.pendingFade}ms linear`;
     next.el.style.opacity = '1';
@@ -380,11 +400,17 @@
     updatePosition();
   }
 
+  // 抵達新照片：扣掉這段距離，剩下的（最多半段）留給下一段，維持定速
+  function carryOdo() {
+    state.odo = state.stepDist ? clamp(state.odo - state.stepDist, 0, state.stepDist * 0.5) : 0;
+    state.stepDist = 0;
+  }
+
   function abortPending(now) {
     const P = state.preload;
     state.pending = null;
     state.busy = false;
-    state.lastStep = now;
+    state.blockedUntil = now + 300;
     P.want = null; P.id = null; P.failed = null;
     setStatus('街景載入失敗，重試中…');
   }
@@ -428,7 +454,7 @@
         state.heading = norm(best.heading);
       }
       state.cam = state.heading; state.camPitch = 0; state.turnVel = 0; state.alignTarget = null;
-      state.lastDir = 0;
+      state.lastDir = 0; state.odo = 0; state.stepDist = 0;
       goTo(data.location.pano, JUMP_FADE);
     });
   }
@@ -475,7 +501,21 @@
     if (!state.auto && !state.keys.size) setStatus(n ? `路口：${n} 條路可走` : '沒有可行駛的道路');
   }
 
-  function step(dir) {
+  // 下一張照片離這裡多遠？預載層已經載好就用真實座標算，否則先用預設值
+  function nextStepDistance(dir) {
+    const r = bestLink(dir === 1 ? state.heading : state.heading + 180, state.auto);
+    const P = state.preload, F = state.front;
+    if (r && P !== F && P.want === r.link.pano && P.id) {
+      const a = F.pano.getPosition(), b = P.pano.getPosition();
+      if (a && b) {
+        const d = distM(a, b);
+        if (d >= 1) return clamp(d, MIN_STEP_M, MAX_STEP_M);
+      }
+    }
+    return DEFAULT_STEP_M;
+  }
+
+  function step(dir, dist, speed) {
     const now = performance.now();
     if (state.busy && now - state.busySince < STEP_TIMEOUT) return;
     const want = dir === 1 ? state.heading : state.heading + 180;
@@ -484,15 +524,15 @@
     if (!r || r.diff > limit) {
       setStatus(dir === 1 ? '前方沒有路，請轉向 ← →' : '後方沒有路');
       if (state.auto && !r) toggleAuto(false);
-      state.lastStep = now;
+      state.blockedUntil = now + 400;
       return;
     }
     // 自動駕駛在路口時，直接轉向新的道路
     if (state.auto && r.diff > 30) state.heading = norm(r.link.heading);
 
-    state.lastStep = now;
     state.lastDir = dir;
-    goTo(r.link.pano, Math.max(FADE_MIN, Math.min(FADE_MAX, GEARS[state.gear].interval * 0.6)));
+    goTo(r.link.pano, clamp((dist / speed) * 600, FADE_MIN, FADE_MAX));
+    state.stepDist = dist;
     if (navigator.vibrate) navigator.vibrate(8);
     setStatus(r.link.description || (dir === 1 ? '前進中' : '倒車中'));
   }
@@ -534,14 +574,23 @@
         applyPov(state.cam, pitch);
       }
 
-      // 前進 / 倒車
+      // 前進 / 倒車：定速累積行駛距離，走滿到下一張照片的距離才換張
       const fwd = k.has('ArrowUp') || k.has('w') || state.auto;
       const back = k.has('ArrowDown') || k.has('s');
-      const interval = GEARS[state.gear].interval;
       let moving = 0;
       if (fwd && !back) moving = 1; else if (back && !fwd) moving = -1;
-      if (moving && now - state.lastStep >= (moving === -1 ? interval * 1.4 : interval)
-          && now - state.arrivedAt >= MIN_DWELL) step(moving);
+      const speed = moving ? (GEARS[state.gear].kmh / 3.6) * (moving === -1 ? REVERSE_FACTOR : 1) : 0;
+      state.speed = speed;
+      if (moving) {
+        if (moving !== state.odoDir) { state.odo = 0; state.odoDir = moving; }
+        const dist = state.stepDist || nextStepDistance(moving);
+        // 等載入時最多多累積一點，避免載好後連跳好幾張
+        state.odo = Math.min(state.odo + speed * dt, dist * 1.25);
+        if (state.odo >= dist && now >= state.blockedUntil && now - state.arrivedAt >= MIN_DWELL) step(moving, dist, speed);
+      } else if (state.odo) {
+        state.odo *= 1 - ease(1.5, dt);   // 停車：畫面慢慢退回原本大小
+        if (state.odo < 0.02) state.odo = 0;
+      }
 
       // 預載層準備好就交叉淡入（逾時也直接換，避免卡住）
       if (state.pending) {
@@ -564,22 +613,29 @@
         state.fading = null;
       }
 
-      // 前進時鏡頭持續推近，看起來像一直往前開，而不是一格一格跳
-      const dollyRate = DOLLY_ZOOM / (interval / 1000);
-      if (moving === 1 && !state.lite) {
-        setZoom(state.front, Math.min(BASE_ZOOM + DOLLY_ZOOM * 1.2, state.front.z + dollyRate * dt));
-      } else if (state.front.z !== BASE_ZOOM) {
-        const z = state.front.z + (BASE_ZOOM - state.front.z) * ease(moving ? 6 : 1.5, dt);
-        setZoom(state.front, Math.abs(z - BASE_ZOOM) < 0.003 ? BASE_ZOOM : z);
-      }
-      if (state.fading && state.lastDir === 1) {
-        setZoom(state.fading, Math.min(BASE_ZOOM + DOLLY_ZOOM * 2.2, state.fading.z + dollyRate * dt));
+      // 前進時鏡頭依行駛距離連續推近，看起來像一直往前開，而不是一格一格跳
+      if (!state.lite) {
+        if (state.odoDir === 1) setZoom(state.front, BASE_ZOOM + DOLLY_PER_M * state.odo);
+        else if (state.front.z !== BASE_ZOOM) {
+          const z = state.front.z + (BASE_ZOOM - state.front.z) * ease(4, dt);
+          setZoom(state.front, Math.abs(z - BASE_ZOOM) < 0.003 ? BASE_ZOOM : z);
+        }
+        if (state.fading && state.lastDir === 1) {
+          setZoom(state.fading, Math.min(BASE_ZOOM + DOLLY_PER_M * MAX_STEP_M * 2, state.fading.z + DOLLY_PER_M * speed * dt));
+        }
+        // 預載層的鏡頭方向跟著轉，換張時那個方向的高解析圖磚已經載好
+        const P = state.preload;
+        if (P !== state.front && P !== state.fading && P.want
+            && (P.povH === undefined || angleDiff(P.povH, state.cam) > 4 || Math.abs(P.povP - state.camPitch) > 4)) {
+          P.povH = state.cam; P.povP = state.camPitch;
+          P.pano.setPov({ heading: state.cam, pitch: state.camPitch });
+        }
       }
 
       if (!state.pending && state.front.id) predictNext();
 
       // 儀表
-      const target = moving ? (METERS_PER_STEP / ((moving === -1 ? interval * 1.4 : interval) / 1000)) * 3.6 : 0;
+      const target = speed * 3.6;
       state.displaySpeed += (target - state.displaySpeed) * Math.min(1, dt * 3);
       setText('speed', els.speed, String(Math.round(state.displaySpeed)));
       setText('gear', els.gear, moving === -1 ? 'R' : (moving ? GEARS[state.gear].name : 'P'));
@@ -630,7 +686,7 @@
 
   function shiftGear(d) {
     state.gear = Math.max(0, Math.min(GEARS.length - 1, state.gear + d));
-    setStatus(`檔位 ${GEARS[state.gear].name}`);
+    setStatus(`檔位 ${GEARS[state.gear].name}：定速 ${GEARS[state.gear].kmh} km/h`);
   }
 
   // ---------- 鍵盤 ----------
@@ -652,6 +708,7 @@
   }, true);
   window.addEventListener('keyup', (e) => { state.keys.delete(keyName(e)); }, true);
   window.addEventListener('blur', () => state.keys.clear());
+  window.addEventListener('resize', () => { BASE_ZOOM = baseZoom(); });
 
   // ---------- 滑鼠 / 觸控拖曳轉動視角 ----------
   // 自己處理拖曳（而不是交給 Google 街景），才不會和每幀的鏡頭平滑跟隨互相搶控制。
