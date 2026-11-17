@@ -94,3 +94,11 @@ capacitor.config.json   原生 App 打包設定
 每張街景照片（panorama）都帶有連到相鄰照片的「連結」（links）與其方向角。
 按下前進時，程式從目前照片的連結中找出與車頭方向夾角最小的一條並切換過去；
 到達後再找出「繼續往前」的連結，讓車頭平滑地轉向道路方向，就能順著彎道一路開下去。
+
+## 部署到 GitHub Pages
+
+推送到 `main` 時，`.github/workflows/pages.yml` 會自動把 `www/` 部署到 GitHub Pages：
+https://timemap26-sudo.github.io/GoogleDrive/
+
+第一次使用前，請到 repo 的 **Settings → Pages → Build and deployment → Source** 選擇 **GitHub Actions**。
+如果 API Key 有限制 HTTP referrer，請加入 `https://timemap26-sudo.github.io/*`。
