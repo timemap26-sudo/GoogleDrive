@@ -1,0 +1,22 @@
+{
+  "name": "street-drive",
+  "version": "1.0.0",
+  "description": "把 Google 街景照片串起來，用方向鍵像開車一樣瀏覽（Web + 手機 App）",
+  "private": true,
+  "scripts": {
+    "start": "npx --yes http-server www -p 8080 -c-1",
+    "cap:add:android": "npx cap add android",
+    "cap:add:ios": "npx cap add ios",
+    "cap:sync": "npx cap sync",
+    "android": "npx cap sync android && npx cap open android",
+    "ios": "npx cap sync ios && npx cap open ios"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.1.2",
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/ios": "^6.1.2"
+  }
+}

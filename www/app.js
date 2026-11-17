@@ -1,0 +1,369 @@
+/* 街景兜風 Street Drive
+ * 把 Google 街景照片一張張串起來，用方向鍵像開車一樣在街道上移動。
+ *
+ *  ↑ / W     前進（沿著最接近車頭方向的道路連結前往下一張街景）
+ *  ↓ / S     倒車
+ *  ← → / A D 轉向
+ *  Space     自動駕駛（會自動沿著道路彎道行駛）
+ *  + / -     切換速度檔位
+ *  M         顯示/隱藏小地圖
+ *  H         顯示/隱藏操作說明
+ */
+(() => {
+  'use strict';
+
+  const CFG = window.STREET_DRIVE_CONFIG || {};
+  const KEY_STORAGE = 'streetDrive.apiKey';
+  const POS_STORAGE = 'streetDrive.lastPos';
+
+  // 每檔位：多久前進一張街景（毫秒）。街景照片間距約 8~12 公尺。
+  const GEARS = [
+    { name: '1', interval: 1400 },
+    { name: '2', interval: 1000 },
+    { name: '3', interval: 750 },
+    { name: '4', interval: 550 },
+    { name: '5', interval: 400 },
+  ];
+  const METERS_PER_STEP = 10;
+  const TURN_RATE = 75;          // 度/秒
+  const ALIGN_RATE = 2.5;        // 自動對齊道路方向的速度（越大越快）
+  const MAX_FORWARD_ANGLE = 80;  // 手動前進時可接受的道路夾角
+  const STEP_TIMEOUT = 3000;     // 等待街景載入的逾時
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    pano: $('pano'), minimap: $('minimap'), status: $('status'),
+    speed: $('speedValue'), gear: $('gear'), needle: $('needle'), headingText: $('headingText'),
+    help: $('help'), autoBtn: $('autoBtn'),
+    keyDialog: $('keyDialog'), keyForm: $('keyForm'), keyInput: $('keyInput'),
+    searchForm: $('searchForm'), searchInput: $('searchInput'), settingsBtn: $('settingsBtn'),
+  };
+
+  const state = {
+    panorama: null, map: null, marker: null, svService: null, geocoder: null,
+    heading: CFG.startHeading || 0,
+    alignTarget: null,        // 道路方向，車頭會慢慢對齊
+    keys: new Set(),
+    gear: 2,
+    auto: false,
+    busy: false,
+    busySince: 0,
+    lastStep: 0,
+    lastDir: 0,               // 1 前進, -1 倒車, 0 停止
+    displaySpeed: 0,
+    lastFrame: performance.now(),
+  };
+
+  // ---------- 工具 ----------
+  const norm = (h) => ((h % 360) + 360) % 360;
+  const angleDiff = (a, b) => { const d = Math.abs(norm(a) - norm(b)) % 360; return d > 180 ? 360 - d : d; };
+  const signedDiff = (from, to) => { let d = norm(to) - norm(from); if (d > 180) d -= 360; if (d < -180) d += 360; return d; };
+  const setStatus = (t) => { els.status.textContent = t; };
+
+  function bestLink(targetHeading, excludeBackward = false) {
+    const links = (state.panorama && state.panorama.getLinks()) || [];
+    let best = null, bestD = Infinity;
+    for (const l of links) {
+      if (!l || !l.pano) continue;
+      const d = angleDiff(l.heading, targetHeading);
+      if (excludeBackward && d > 135) continue;
+      if (d < bestD) { bestD = d; best = l; }
+    }
+    return best ? { link: best, diff: bestD } : null;
+  }
+
+  // ---------- API Key / 載入 Google Maps ----------
+  function getApiKey() {
+    const url = new URLSearchParams(location.search).get('key');
+    if (url) { try { localStorage.setItem(KEY_STORAGE, url); } catch (_) {} return url; }
+    if (CFG.apiKey) return CFG.apiKey;
+    try { return localStorage.getItem(KEY_STORAGE) || ''; } catch (_) { return ''; }
+  }
+
+  function askKey() {
+    els.keyInput.value = getApiKey();
+    if (!els.keyDialog.open) els.keyDialog.showModal();
+  }
+
+  els.keyForm.addEventListener('submit', () => {
+    const k = els.keyInput.value.trim();
+    if (!k) return;
+    try { localStorage.setItem(KEY_STORAGE, k); } catch (_) {}
+    if (window.google && window.google.maps) location.reload();
+    else loadMaps(k);
+  });
+  els.settingsBtn.addEventListener('click', askKey);
+
+  window.gm_authFailure = () => {
+    setStatus('API Key 無效或未啟用 Maps JavaScript API');
+    try { localStorage.removeItem(KEY_STORAGE); } catch (_) {}
+    askKey();
+  };
+
+  function loadMaps(key) {
+    setStatus('載入 Google Maps…');
+    window.__streetDriveInit = init;
+    const s = document.createElement('script');
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&language=zh-TW&callback=__streetDriveInit`;
+    s.async = true;
+    s.onerror = () => setStatus('無法載入 Google Maps，請檢查網路');
+    document.head.appendChild(s);
+  }
+
+  // ---------- 初始化 ----------
+  function init() {
+    const g = google.maps;
+    state.svService = new g.StreetViewService();
+    state.geocoder = new g.Geocoder();
+
+    state.panorama = new g.StreetViewPanorama(els.pano, {
+      pov: { heading: state.heading, pitch: 0 },
+      zoom: 0,
+      disableDefaultUI: true,
+      showRoadLabels: true,
+      linksControl: true,
+      addressControl: true,
+      addressControlOptions: { position: g.ControlPosition.BOTTOM_CENTER },
+      clickToGo: false,
+      scrollwheel: false,
+      keyboardShortcuts: false,
+      motionTracking: false,
+      motionTrackingControl: false,
+    });
+
+    state.map = new g.Map(els.minimap, {
+      center: CFG.start, zoom: 17, disableDefaultUI: true, gestureHandling: 'none',
+      keyboardShortcuts: false, clickableIcons: false,
+    });
+    state.marker = new g.Marker({
+      map: state.map, position: CFG.start, clickable: false,
+      icon: { path: g.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, rotation: state.heading,
+        fillColor: '#f43f5e', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 },
+    });
+    // 點小地圖可以瞬間移動
+    state.map.setOptions({ gestureHandling: 'greedy' });
+    state.map.addListener('click', (e) => jumpTo(e.latLng));
+
+    state.panorama.addListener('pano_changed', onArrive);
+    state.panorama.addListener('links_changed', onLinks);
+    state.panorama.addListener('position_changed', () => {
+      const p = state.panorama.getPosition();
+      if (!p) return;
+      state.map.panTo(p);
+      state.marker.setPosition(p);
+      try { localStorage.setItem(POS_STORAGE, JSON.stringify({ lat: p.lat(), lng: p.lng(), h: state.heading })); } catch (_) {}
+    });
+    // 使用者若用滑鼠拖曳畫面，同步車頭方向
+    state.panorama.addListener('pov_changed', () => {
+      const h = state.panorama.getPov().heading;
+      if (angleDiff(h, state.heading) > 0.5 && !state.keys.size && !state.auto) {
+        state.heading = norm(h);
+        state.alignTarget = null;
+      }
+    });
+
+    let start = CFG.start;
+    try {
+      const saved = JSON.parse(localStorage.getItem(POS_STORAGE) || 'null');
+      if (saved && typeof saved.lat === 'number') { start = saved; state.heading = saved.h || 0; }
+    } catch (_) {}
+    jumpTo(start);
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- 找街景 / 跳轉 ----------
+  function jumpTo(latLng, radius = 80) {
+    setStatus('尋找附近的街景…');
+    state.svService.getPanorama({
+      location: latLng, radius,
+      preference: google.maps.StreetViewPreference.NEAREST,
+      source: google.maps.StreetViewSource.OUTDOOR,
+    }, (data, status) => {
+      if (status !== google.maps.StreetViewStatus.OK) {
+        if (radius < 1000) return jumpTo(latLng, radius * 4);
+        setStatus('這附近沒有街景，換個地點試試');
+        return;
+      }
+      state.busy = true; state.busySince = performance.now();
+      // 車頭朝向最接近目前方向的道路
+      const links = data.links || [];
+      if (links.length) {
+        let best = links[0];
+        for (const l of links) if (angleDiff(l.heading, state.heading) < angleDiff(best.heading, state.heading)) best = l;
+        state.heading = norm(best.heading);
+      }
+      state.panorama.setPano(data.location.pano);
+      state.panorama.setPov({ heading: state.heading, pitch: 0 });
+      state.panorama.setVisible(true);
+    });
+  }
+
+  els.searchForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = els.searchInput.value.trim();
+    els.searchInput.blur();
+    if (!q || !state.geocoder) return;
+    const m = q.match(/^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (m) return jumpTo({ lat: parseFloat(m[1]), lng: parseFloat(m[2]) });
+    setStatus('搜尋中…');
+    state.geocoder.geocode({ address: q }, (res, status) => {
+      if (status === 'OK' && res[0]) jumpTo(res[0].geometry.location);
+      else setStatus('找不到地點（需要啟用 Geocoding API，或直接輸入經緯度）');
+    });
+  });
+
+  // ---------- 開車核心 ----------
+  function onArrive() {
+    state.busy = false;
+    state.panorama.setPov({ heading: state.heading, pitch: 0 });
+    onLinks();
+  }
+
+  function onLinks() {
+    // 到新的一張街景後，找出「繼續往前」的道路，讓車頭順著彎道慢慢轉過去
+    const ref = state.lastDir === -1 ? state.heading + 180 : state.heading;
+    const r = bestLink(ref);
+    if (r && r.diff < 50) {
+      state.alignTarget = state.lastDir === -1 ? norm(r.link.heading + 180) : norm(r.link.heading);
+    } else {
+      state.alignTarget = null;
+    }
+    const n = (state.panorama.getLinks() || []).length;
+    if (!state.auto && !state.keys.size) setStatus(n ? `路口：${n} 條路可走` : '沒有可行駛的道路');
+  }
+
+  function step(dir) {
+    const now = performance.now();
+    if (state.busy && now - state.busySince < STEP_TIMEOUT) return;
+    const want = dir === 1 ? state.heading : state.heading + 180;
+    const r = bestLink(want, state.auto);
+    const limit = state.auto ? 135 : MAX_FORWARD_ANGLE;
+    if (!r || r.diff > limit) {
+      setStatus(dir === 1 ? '前方沒有路，請轉向 ← →' : '後方沒有路');
+      if (state.auto && !r) toggleAuto(false);
+      state.lastStep = now;
+      return;
+    }
+    // 自動駕駛在路口時，直接轉向新的道路
+    if (state.auto && r.diff > 30) state.heading = norm(r.link.heading);
+
+    state.busy = true;
+    state.busySince = now;
+    state.lastStep = now;
+    state.lastDir = dir;
+    state.panorama.setPano(r.link.pano);
+    pulse(dir);
+    setStatus(r.link.description || (dir === 1 ? '前進中' : '倒車中'));
+  }
+
+  function pulse(dir) {
+    const c = els.pano.classList;
+    c.remove('surge', 'reverse');
+    void els.pano.offsetWidth; // 重新觸發動畫
+    c.add(dir === 1 ? 'surge' : 'reverse');
+    if (navigator.vibrate) navigator.vibrate(8);
+  }
+
+  function loop(now) {
+    const dt = Math.min(0.1, (now - state.lastFrame) / 1000);
+    state.lastFrame = now;
+    const k = state.keys;
+
+    if (state.panorama) {
+      // 轉向
+      let turn = 0;
+      if (k.has('ArrowLeft') || k.has('a')) turn -= 1;
+      if (k.has('ArrowRight') || k.has('d')) turn += 1;
+      const prev = state.heading;
+      if (turn) {
+        state.heading = norm(state.heading + turn * TURN_RATE * dt);
+        state.alignTarget = null;
+      } else if (state.alignTarget !== null) {
+        const d = signedDiff(state.heading, state.alignTarget);
+        if (Math.abs(d) < 0.3) { state.heading = state.alignTarget; state.alignTarget = null; }
+        else state.heading = norm(state.heading + d * Math.min(1, ALIGN_RATE * dt));
+      }
+      if (state.heading !== prev) {
+        const pov = state.panorama.getPov();
+        state.panorama.setPov({ heading: state.heading, pitch: pov.pitch * 0.9 });
+      }
+
+      // 前進 / 倒車
+      const fwd = k.has('ArrowUp') || k.has('w') || state.auto;
+      const back = k.has('ArrowDown') || k.has('s');
+      const interval = GEARS[state.gear].interval;
+      let moving = 0;
+      if (fwd && !back) moving = 1; else if (back && !fwd) moving = -1;
+      if (moving && now - state.lastStep >= (moving === -1 ? interval * 1.4 : interval)) step(moving);
+
+      // 儀表
+      const target = moving ? (METERS_PER_STEP / ((moving === -1 ? interval * 1.4 : interval) / 1000)) * 3.6 : 0;
+      state.displaySpeed += (target - state.displaySpeed) * Math.min(1, dt * 3);
+      els.speed.textContent = Math.round(state.displaySpeed);
+      els.gear.textContent = moving === -1 ? 'R' : (moving ? GEARS[state.gear].name : 'P');
+      els.needle.style.transform = `rotate(${-state.heading}deg)`;
+      els.headingText.textContent = `${Math.round(state.heading)}°`;
+      const icon = state.marker.getIcon();
+      if (Math.abs((icon.rotation || 0) - state.heading) > 1) { icon.rotation = state.heading; state.marker.setIcon(icon); }
+    }
+    requestAnimationFrame(loop);
+  }
+
+  function toggleAuto(on = !state.auto) {
+    state.auto = on;
+    els.autoBtn.classList.toggle('on', on);
+    setStatus(on ? '自動駕駛中（方向鍵可轉彎，空白鍵停止）' : '自動駕駛關閉');
+  }
+
+  function shiftGear(d) {
+    state.gear = Math.max(0, Math.min(GEARS.length - 1, state.gear + d));
+    setStatus(`檔位 ${GEARS[state.gear].name}`);
+  }
+
+  // ---------- 鍵盤 ----------
+  const DRIVE_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 'a', 's', 'd']);
+  function keyName(e) { return e.key.length === 1 ? e.key.toLowerCase() : e.key; }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.target === els.searchInput || e.target === els.keyInput) return;
+    const k = keyName(e);
+    if (DRIVE_KEYS.has(k)) { state.keys.add(k); e.preventDefault(); e.stopPropagation(); return; }
+    if (e.repeat) return;
+    if (k === ' ') { toggleAuto(); e.preventDefault(); }
+    else if (k === '+' || k === '=') shiftGear(1);
+    else if (k === '-' || k === '_') shiftGear(-1);
+    else if (k === 'm') els.minimap.classList.toggle('hidden');
+    else if (k === 'h') els.help.classList.toggle('hidden');
+  }, true);
+  window.addEventListener('keyup', (e) => { state.keys.delete(keyName(e)); }, true);
+  window.addEventListener('blur', () => state.keys.clear());
+
+  // ---------- 觸控按鈕 ----------
+  document.querySelectorAll('#touchControls [data-key]').forEach((btn) => {
+    const key = btn.dataset.key;
+    const isHold = DRIVE_KEYS.has(key);
+    const down = (e) => {
+      e.preventDefault();
+      btn.setPointerCapture && btn.setPointerCapture(e.pointerId);
+      btn.classList.add('active');
+      if (isHold) state.keys.add(key);
+      else shiftGear(key === '+' ? 1 : -1);
+    };
+    const up = () => { btn.classList.remove('active'); if (isHold) state.keys.delete(key); };
+    btn.addEventListener('pointerdown', down);
+    btn.addEventListener('pointerup', up);
+    btn.addEventListener('pointercancel', up);
+    btn.addEventListener('lostpointercapture', up);
+    btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  });
+  els.autoBtn.addEventListener('click', () => toggleAuto());
+
+  // ---------- PWA ----------
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+
+  // ---------- 啟動 ----------
+  const key = getApiKey();
+  if (key) loadMaps(key); else { setStatus('請輸入 Google Maps API Key'); askKey(); }
+})();
