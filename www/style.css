@@ -74,12 +74,27 @@ button:active { filter: brightness(1.3); }
   max-width: 46vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-#minimap {
+#minimapWrap {
   position: absolute; right: 12px; top: calc(64px + var(--safe-t));
   width: 220px; height: 160px; border-radius: 12px; overflow: hidden;
   border: 2px solid #334155; z-index: 4; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  transition: width 0.25s ease, height 0.25s ease;
 }
-#minimap.hidden { display: none; }
+#minimapWrap.hidden { display: none; }
+#minimapWrap.expanded {
+  width: min(560px, calc(100vw - 24px));
+  height: min(420px, calc(100vh - 64px - var(--safe-t) - 180px));
+  z-index: 7;
+}
+#minimap { width: 100%; height: 100%; }
+#mapControls {
+  position: absolute; top: 6px; left: 6px; display: flex; flex-direction: column; gap: 4px; z-index: 1;
+}
+#mapControls button {
+  width: 30px; height: 30px; padding: 0; border-radius: 8px; font-size: 16px; line-height: 1;
+  background: rgba(15, 23, 42, 0.85); color: #e2e8f0; border: 1px solid #475569; cursor: pointer;
+}
+#mapControls button:active { background: rgba(34, 211, 238, 0.5); }
 
 #help {
   position: absolute; left: 50%; transform: translateX(-50%);
@@ -120,7 +135,9 @@ button:active { filter: brightness(1.3); }
   #gear { bottom: 5px; font-size: 11px; }
   #compass { display: none; }
   #status { display: none; }
-  #minimap { width: 130px; height: 100px; }
+  #minimapWrap { width: 130px; height: 100px; }
+  #minimapWrap.expanded { width: calc(100vw - 24px); height: 45vh; }
+  #mapControls button { width: 26px; height: 26px; font-size: 14px; }
 }
 
 dialog {
