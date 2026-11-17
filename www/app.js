@@ -8,6 +8,7 @@
  *  + / -     切換速度檔位
  *  M         顯示/隱藏小地圖
  *  N         放大/縮小小地圖
+ *  B         小地圖切換 一般/衛星
  *  H         顯示/隱藏操作說明
  */
 (() => {
@@ -16,6 +17,7 @@
   const CFG = window.STREET_DRIVE_CONFIG || {};
   const KEY_STORAGE = 'streetDrive.apiKey';
   const POS_STORAGE = 'streetDrive.lastPos';
+  const MAPTYPE_STORAGE = 'streetDrive.mapType';
 
   // 每檔位：多久前進一張街景（毫秒）。街景照片間距約 8~12 公尺。
   const GEARS = [
@@ -157,6 +159,8 @@
     $('mapExpand').addEventListener('click', toggleMapExpand);
     $('mapZoomIn').addEventListener('click', () => state.map.setZoom(state.map.getZoom() + 1));
     $('mapZoomOut').addEventListener('click', () => state.map.setZoom(state.map.getZoom() - 1));
+    $('mapType').addEventListener('click', toggleMapType);
+    try { if (localStorage.getItem(MAPTYPE_STORAGE) === 'hybrid') toggleMapType(); } catch (_) {}
 
     state.panorama.addListener('pano_changed', onArrive);
     state.panorama.addListener('links_changed', onLinks);
@@ -364,6 +368,18 @@
     }
   }
 
+  // 小地圖切換 一般 / 衛星（含道路標示）
+  function toggleMapType() {
+    if (!state.map) return;
+    const sat = state.map.getMapTypeId() !== 'hybrid';
+    state.map.setMapTypeId(sat ? 'hybrid' : 'roadmap');
+    const btn = $('mapType');
+    btn.textContent = sat ? '🗺' : '🛰';
+    btn.title = sat ? '切換一般地圖 (B)' : '切換衛星地圖 (B)';
+    btn.setAttribute('aria-label', btn.title);
+    try { localStorage.setItem(MAPTYPE_STORAGE, sat ? 'hybrid' : 'roadmap'); } catch (_) {}
+  }
+
   function shiftGear(d) {
     state.gear = Math.max(0, Math.min(GEARS.length - 1, state.gear + d));
     setStatus(`檔位 ${GEARS[state.gear].name}`);
@@ -383,6 +399,7 @@
     else if (k === '-' || k === '_') shiftGear(-1);
     else if (k === 'm') els.minimapWrap.classList.toggle('hidden');
     else if (k === 'n') toggleMapExpand();
+    else if (k === 'b') toggleMapType();
     else if (k === 'h') els.help.classList.toggle('hidden');
   }, true);
   window.addEventListener('keyup', (e) => { state.keys.delete(keyName(e)); }, true);
