@@ -331,12 +331,18 @@
     if (!state.layers.length || document.hidden) return;
     // 保險：目前顯示的圖層一定要是可見的
     const F = state.front;
-    if (F && (state.lite || !state.pending) && F.el.style.opacity !== '1' && (F.id || state.lite)) showLayer(F);
+    if (!F) return;
+    if (state.fading && performance.now() > state.fadeUntil + 1000) {
+      const X = state.fading; state.fading = null;
+      X.el.style.transition = 'none'; X.el.style.opacity = '0'; X.el.style.zIndex = '1';
+    }
+    if (F.el.style.display === 'none') F.el.style.display = '';
+    if ((state.lite || !state.pending || F.id) && F.el.style.opacity !== '1' && (F.id || state.lite)) showLayer(F);
   }
 
   function setZoom(L, z) {
     L.z = z;
-    if (Math.abs(L.zApplied - z) > 0.004 || (z === BASE_ZOOM && L.zApplied !== BASE_ZOOM)) { L.zApplied = z; L.pano.setZoom(z); }
+    if (Math.abs(L.zApplied - z) > 0.015 || (z === BASE_ZOOM && L.zApplied !== BASE_ZOOM)) { L.zApplied = z; L.pano.setZoom(z); }
   }
 
   // 在預載層載入指定的街景（不顯示）
@@ -539,7 +545,10 @@
     };
   }
 
+  // 隱藏的預載層不需要每幀更新（它看不見），只在載好時與換張前對齊一次，
+  // 避免三個 WebGL 街景同時每幀重繪/重抓圖磚，手機 GPU 記憶體撐不住就會整片黑屏。
   function renderLayer(L) {
+    L.renderedAt = performance.now();
     let off = { x: 0, y: 0 };
     if (!state.lite) {
       off = state.vOff;
@@ -549,7 +558,7 @@
       }
     }
     const v = viewFor(off);
-    if (L.povH === undefined || angleDiff(v.heading, L.povH) > 0.01 || Math.abs(v.pitch - L.povP) > 0.01) {
+    if (L.povH === undefined || angleDiff(v.heading, L.povH) > 0.05 || Math.abs(v.pitch - L.povP) > 0.05) {
       L.povH = v.heading; L.povP = v.pitch;
       L.pano.setPov({ heading: v.heading, pitch: v.pitch });
     }
@@ -560,6 +569,12 @@
   function setText(key, el, v) { if (state.ui[key] !== v) { state.ui[key] = v; el.textContent = v; } }
 
   function loop(now) {
+    // 先排好下一幀：就算這一幀出錯，畫面也不會停在全部隱藏（黑屏）的狀態
+    requestAnimationFrame(loop);
+    try { frame(now); } catch (err) { console.error(err); showLayer(state.front); }
+  }
+
+  function frame(now) {
     const dt = Math.min(0.1, (now - state.lastFrame) / 1000);
     state.lastFrame = now;
     const k = state.keys;
@@ -611,7 +626,7 @@
           const fade = clamp((d / speed) * 500, FADE_MIN, FADE_MAX);
           // 讓交叉淡入的正中間剛好落在兩張照片的中點（單圖層模式則走到下一張才換）
           const at = state.lite ? d : d / 2 - speed * fade / 2000;
-          if (r && p + adv >= at && now >= state.blockedUntil && now - state.arrivedAt >= MIN_DWELL
+          if (r && p + adv >= at - 0.01 && now >= state.blockedUntil && now - state.arrivedAt >= MIN_DWELL
               && !(state.busy && now - state.busySince < STEP_TIMEOUT)) commit(moving, r, d, speed);
         } else if (!state.pending) {
           speed = 0;
@@ -650,7 +665,7 @@
       if (!state.lite) {
         if (state.fading) renderLayer(state.fading);
         const P = state.preload;
-        if (P !== state.front && P !== state.fading && P.want) renderLayer(P);
+        if (P !== state.front && P !== state.fading && P.id && now - (P.renderedAt || 0) > 400) renderLayer(P);
       }
 
       if (!state.pending && state.front.id) predictNext();
@@ -669,7 +684,6 @@
       const icon = state.marker.getIcon();
       if (angleDiff(icon.rotation || 0, state.cam) > 2) { icon.rotation = state.cam; state.marker.setIcon(icon); }
     }
-    requestAnimationFrame(loop);
   }
 
   function toggleAuto(on = !state.auto) {
