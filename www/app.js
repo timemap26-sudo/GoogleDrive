@@ -10,6 +10,7 @@
  *  N         放大/縮小小地圖
  *  B         小地圖切換 一般/衛星
  *  H         顯示/隱藏操作說明
+ *  滑鼠/手指拖曳畫面  轉動視角（左右改變車頭方向、上下看天空/地面）
  */
 (() => {
   'use strict';
@@ -42,6 +43,8 @@
   const DOLLY_ZOOM = 0.42;       // 每前進一張推近的 zoom 量（約等於往前 10 公尺的放大）
   const FADE_MIN = 220, FADE_MAX = 520, JUMP_FADE = 600; // 交叉淡入時間（毫秒）
   const TILE_GRACE = 140;        // 剛載好資料時多等一下，讓影像圖磚載入再淡入
+  const DRAG_FOV = 100;          // 拖過整個畫面寬度約轉動的角度
+  const MAX_PITCH = 80;
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -63,6 +66,7 @@
     arrivedAt: 0,
     alignTarget: null,        // 道路方向，車頭會慢慢對齊
     keys: new Set(),
+    drag: null,               // 滑鼠/觸控拖曳中的指標
     gear: 2,
     auto: false,
     busy: false,
@@ -394,9 +398,11 @@
         else state.heading = norm(state.heading + d * ease(ALIGN_RATE, dt));
       }
 
-      // 鏡頭平滑跟隨車頭方向；pitch 慢慢回正
+      // 鏡頭平滑跟隨車頭方向；行駛中 pitch 慢慢回正（拖曳中或停車時保留使用者的視角）
       const cd = signedDiff(state.cam, state.heading);
-      const pitch = Math.abs(state.camPitch) < 0.05 ? 0 : state.camPitch * (1 - ease(3, dt));
+      const driving = state.auto || k.has('ArrowUp') || k.has('w') || k.has('ArrowDown') || k.has('s');
+      const pitch = state.drag || !driving ? state.camPitch
+        : Math.abs(state.camPitch) < 0.05 ? 0 : state.camPitch * (1 - ease(3, dt));
       if (Math.abs(cd) > 0.02 || pitch !== state.camPitch) {
         state.cam = Math.abs(cd) < 0.02 ? state.heading : norm(state.cam + cd * ease(CAM_SMOOTH, dt));
         state.camPitch = pitch;
@@ -515,6 +521,46 @@
   }, true);
   window.addEventListener('keyup', (e) => { state.keys.delete(keyName(e)); }, true);
   window.addEventListener('blur', () => state.keys.clear());
+
+  // ---------- 滑鼠 / 觸控拖曳轉動視角 ----------
+  // 自己處理拖曳（而不是交給 Google 街景），才不會和每幀的鏡頭平滑跟隨互相搶控制。
+  const panoEl = $('pano');
+  panoEl.style.cursor = 'grab';
+  panoEl.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (state.drag || !state.panorama) return;
+    e.preventDefault();
+    e.stopPropagation();
+    state.drag = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    try { panoEl.setPointerCapture(e.pointerId); } catch (_) {}
+    panoEl.style.cursor = 'grabbing';
+  }, true);
+  panoEl.addEventListener('pointermove', (e) => {
+    const d = state.drag;
+    if (!d || d.id !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const sens = DRAG_FOV / Math.max(1, panoEl.clientWidth) / Math.pow(2, state.front ? state.front.z : 0);
+    const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    d.x = e.clientX; d.y = e.clientY;
+    // 抓住畫面拖：往右拖 → 視角往左轉；往下拖 → 往上看
+    state.heading = state.cam = norm(state.cam - dx * sens);
+    state.camPitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, state.camPitch + dy * sens));
+    state.alignTarget = null;
+    state.turnVel = 0;
+    applyPov(state.cam, state.camPitch);
+  }, true);
+  const endDrag = (e) => {
+    if (!state.drag || state.drag.id !== e.pointerId) return;
+    state.drag = null;
+    panoEl.style.cursor = 'grab';
+  };
+  panoEl.addEventListener('pointerup', endDrag, true);
+  panoEl.addEventListener('pointercancel', endDrag, true);
+  panoEl.addEventListener('lostpointercapture', endDrag, true);
+  // 擋掉 Google 街景自己的拖曳處理
+  ['mousedown', 'touchstart', 'touchmove'].forEach((t) =>
+    panoEl.addEventListener(t, (e) => e.stopPropagation(), { capture: true, passive: true }));
 
   // ---------- 觸控按鈕 ----------
   document.querySelectorAll('#touchControls [data-key]').forEach((btn) => {
