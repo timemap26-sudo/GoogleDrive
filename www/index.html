@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>街景兜風 Street Drive</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="pano"></div>
+  <div id="windshield" aria-hidden="true"></div>
+
+  <!-- 頂部列：搜尋 -->
+  <header id="topbar">
+    <form id="searchForm" autocomplete="off">
+      <input id="searchInput" type="text" placeholder="輸入地點或 緯度,經度 (例: 25.0330,121.5654)">
+      <button type="submit">出發</button>
+    </form>
+    <button id="settingsBtn" class="icon-btn" title="設定">⚙</button>
+  </header>
+
+  <!-- 儀表板 -->
+  <section id="hud">
+    <div id="speedo">
+      <div id="speedValue">0</div>
+      <div class="unit">km/h</div>
+      <div id="gear">P</div>
+    </div>
+    <div id="compass"><div id="needle">▲</div><span id="headingText">0°</span></div>
+    <div id="status">準備中…</div>
+  </section>
+
+  <div id="minimap"></div>
+
+  <!-- 手機觸控方向盤 -->
+  <section id="touchControls" aria-label="駕駛控制">
+    <div class="dpad">
+      <button class="ctl up" data-key="ArrowUp" aria-label="前進">▲</button>
+      <button class="ctl left" data-key="ArrowLeft" aria-label="左轉">◀</button>
+      <button class="ctl right" data-key="ArrowRight" aria-label="右轉">▶</button>
+      <button class="ctl down" data-key="ArrowDown" aria-label="倒車">▼</button>
+    </div>
+    <div class="side">
+      <button class="ctl small" id="autoBtn" aria-label="自動駕駛">AUTO</button>
+      <button class="ctl small" data-key="+" aria-label="加速檔">＋</button>
+      <button class="ctl small" data-key="-" aria-label="減速檔">－</button>
+    </div>
+  </section>
+
+  <div id="help">
+    <b>操作</b>：↑ 前進 ↓ 倒車 ← → 轉向 ｜ 空白鍵 自動駕駛 ｜ +/- 速度 ｜ M 地圖 ｜ H 隱藏說明
+  </div>
+
+  <!-- API Key 設定 -->
+  <dialog id="keyDialog">
+    <form method="dialog" id="keyForm">
+      <h2>🚗 街景兜風</h2>
+      <p>本程式使用 Google Maps JavaScript API 的街景服務，請輸入你的 API Key（只會儲存在這台裝置的瀏覽器中）。</p>
+      <input id="keyInput" type="text" placeholder="AIza..." required>
+      <p class="hint">需在 Google Cloud Console 啟用 <b>Maps JavaScript API</b>（搜尋地名另需 <b>Geocoding API</b>）。</p>
+      <menu>
+        <button type="submit" value="ok">開始</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
