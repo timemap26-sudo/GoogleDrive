@@ -135,7 +135,11 @@ button:active { filter: brightness(1.3); }
   #speedo .unit { font-size: 9px; }
   #gear { bottom: 5px; font-size: 11px; }
   #compass { display: none; }
-  #status { display: none; }
+  /* 手機也顯示狀態（載入中/錯誤），否則畫面暗掉時完全不知道發生什麼事 */
+  #status {
+    position: fixed; left: 10px; top: calc(58px + var(--safe-t));
+    max-width: calc(100vw - 170px); font-size: 12px; padding: 4px 8px;
+  }
   #minimapWrap { width: 130px; height: 100px; }
   #minimapWrap.expanded { width: calc(100vw - 24px); height: 45vh; }
   #mapControls button { width: 26px; height: 26px; font-size: 14px; }

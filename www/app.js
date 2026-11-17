@@ -68,6 +68,7 @@
     keys: new Set(),
     drag: null,               // 滑鼠/觸控拖曳中的指標
     gear: 2,
+    lite: false,              // 單圖層模式（裝置 WebGL 記憶體不足時自動切換）
     auto: false,
     busy: false,
     busySince: 0,
@@ -183,6 +184,7 @@
       const saved = JSON.parse(localStorage.getItem(POS_STORAGE) || 'null');
       if (saved && typeof saved.lat === 'number') { start = saved; state.heading = saved.h || 0; }
     } catch (_) {}
+    if (new URLSearchParams(location.search).get('lite') === '1') enterLite();
     jumpTo(start);
     requestAnimationFrame(loop);
     setInterval(healthCheck, 2000);
@@ -191,11 +193,21 @@
 
   // ---------- 全景圖層 ----------
   function makeLayer(el, opts) {
-    const L = { el, opts, pano: null, want: null, id: null, readyAt: 0, z: BASE_ZOOM, zApplied: BASE_ZOOM };
+    const L = { el, opts, pano: null, want: null, id: null, prevId: null, failed: null, readyAt: 0,
+      z: BASE_ZOOM, zApplied: BASE_ZOOM, dead: false, lostAt: 0, restoredAt: 0, rebuiltAt: 0 };
     buildPano(L);
-    // WebGL 畫布失效（手機記憶體不足、切到背景再回來）時街景會整片變黑，重建該圖層
-    el.addEventListener('webglcontextlost', () => rebuildLayer(L), true);
+    // WebGL 畫布失效（手機記憶體不足、切到背景再回來）時街景會整片變黑。
+    // 注意：不可以自己對畫布呼叫 getContext() 檢查，那會搶走/多開 WebGL context，反而造成黑屏。
+    el.addEventListener('webglcontextlost', (e) => onContextLost(L, e.target), true);
+    el.addEventListener('webglcontextrestored', () => { L.restoredAt = performance.now(); }, true);
     return L;
+  }
+
+  // 圖層載好指定的街景了嗎？Google 有時會把 pano id 換成別名，所以只要換成「新的一張」就算載好
+  function markReady(L) {
+    const id = L.pano.getPano();
+    if (!L.want || L.id || !id) return;
+    if (id === L.want || id !== L.prevId) { L.id = L.want; L.readyAt = performance.now(); }
   }
 
   function buildPano(L) {
@@ -207,9 +219,13 @@
     L.pano = new google.maps.StreetViewPanorama(host, L.opts);
     L.zApplied = L.z = BASE_ZOOM;
     L.pano.addListener('links_changed', () => {
-      const id = L.pano.getPano();
-      if (id && id === L.want && L.id !== id) { L.id = id; L.readyAt = performance.now(); }
+      markReady(L);
       if (L === state.front && !state.pending) onLinks();
+    });
+    L.pano.addListener('status_changed', () => {
+      const s = L.pano.getStatus();
+      if (s === 'OK') markReady(L);
+      else if (s && L.want && !L.id) L.failed = L.want;   // 這張載入失敗，不要等到逾時
     });
     L.pano.addListener('position_changed', () => { if (L === state.front) updatePosition(); });
     // 使用者若用滑鼠拖曳畫面，同步車頭方向
@@ -228,38 +244,74 @@
     });
   }
 
-  function rebuildLayer(L) {
-    if (L.rebuilding) return;
-    L.rebuilding = true;
+  function onContextLost(L, canvas) {
+    if (L.dead) return;
+    const lostAt = L.lostAt = performance.now();
+    // 給 Google 一點時間自己復原；畫布若已被 Google 自己移除，就不是我們的問題
     setTimeout(() => {
-      L.rebuilding = false;
-      const id = L.id || L.want;
-      buildPano(L);
-      L.want = null; L.id = null; L.readyAt = 0;
-      if (L === state.front) {
-        state.panorama = L.pano;
-        if (id) loadInto(L, id);
-      }
-    }, 50);
+      if (L.dead || L.restoredAt > lostAt || !canvas.isConnected || !L.el.contains(canvas)) return;
+      // 裝置撐不住多個 WebGL 街景：改用單一圖層（省記憶體），再把目前畫面重建回來
+      enterLite();
+      if (L === state.front) rebuildLayer(L);
+    }, 1200);
   }
 
-  function contextLost(L) {
-    for (const c of L.el.querySelectorAll('canvas')) {
-      let gl = null;
-      try { gl = c.getContext('webgl2') || c.getContext('webgl'); } catch (_) {}
-      if (gl && gl.isContextLost()) return true;
+  function rebuildLayer(L) {
+    if (L.dead) return;
+    const now = performance.now();
+    if (now - L.rebuiltAt < 3000) { setTimeout(() => rebuildLayer(L), 3000); return; }
+    L.rebuiltAt = now;
+    const id = L.id || L.want;
+    buildPano(L);
+    L.want = null; L.id = null; L.prevId = null; L.failed = null; L.readyAt = 0;
+    if (L === state.front) {
+      state.panorama = L.pano;
+      if (id) loadInto(L, id);
+      showLayer(L);
     }
-    return false;
+  }
+
+  // 釋放不再使用的圖層（連同它的 WebGL 記憶體）
+  function destroyLayer(L) {
+    L.dead = true;
+    try { google.maps.event.clearInstanceListeners(L.pano); L.pano.setVisible(false); } catch (_) {}
+    for (const c of L.el.querySelectorAll('canvas')) {
+      try {
+        const gl = c.getContext('webgl2') || c.getContext('webgl');
+        const ext = gl && gl.getExtension('WEBGL_lose_context');
+        if (ext) ext.loseContext();
+      } catch (_) {}
+    }
+    L.el.textContent = '';
+    L.el.style.display = 'none';
+  }
+
+  function showLayer(L) {
+    L.el.style.transition = 'none'; L.el.style.opacity = '1'; L.el.style.zIndex = '3';
+  }
+
+  // 省電/低記憶體模式：只用一個街景圖層，換張交給 Google 自己的過場（不會黑屏）
+  function enterLite() {
+    if (state.lite) return;
+    state.lite = true;
+    const F = state.front;
+    const pend = state.pending;
+    for (const L of state.layers) if (L !== F) destroyLayer(L);
+    state.layers = [F];
+    state.preload = F;
+    state.fading = null;
+    state.pending = null;
+    state.busy = false;
+    setZoom(F, BASE_ZOOM);
+    showLayer(F);
+    if (pend) goTo(pend, 0);
   }
 
   function healthCheck() {
     if (!state.layers.length || document.hidden) return;
-    for (const L of state.layers) if (contextLost(L)) rebuildLayer(L);
     // 保險：目前顯示的圖層一定要是可見的
     const F = state.front;
-    if (F && !state.pending && F.el.style.opacity !== '1') {
-      F.el.style.transition = 'none'; F.el.style.opacity = '1'; F.el.style.zIndex = '3';
-    }
+    if (F && (state.lite || !state.pending) && F.el.style.opacity !== '1' && (F.id || state.lite)) showLayer(F);
   }
 
   function setZoom(L, z) {
@@ -270,10 +322,18 @@
   // 在預載層載入指定的街景（不顯示）
   function loadInto(L, id) {
     if (L.want === id) return;
-    L.want = id; L.id = null; L.readyAt = 0;
-    L.pano.setPov({ heading: state.cam, pitch: state.camPitch });
-    setZoom(L, BASE_ZOOM);
-    L.pano.setPano(id);
+    L.prevId = L.pano.getPano() || null;
+    L.want = id; L.id = null; L.readyAt = 0; L.failed = null;
+    if (L !== state.front) {
+      L.pano.setPov({ heading: state.cam, pitch: state.camPitch });
+      setZoom(L, BASE_ZOOM);
+    }
+    if (L.prevId === id && L.pano.getStatus() === 'OK') {
+      // 已經是這一張了（例如逾時後重試）：setPano 不會再觸發事件，直接視為載好
+      L.id = id; L.readyAt = performance.now();
+    } else {
+      L.pano.setPano(id);
+    }
     L.pano.setVisible(true);
   }
 
@@ -287,6 +347,14 @@
   }
 
   function swap(now) {
+    if (state.lite) {
+      // 單圖層：新照片就載在目前的圖層上，不需要換層
+      state.pending = null;
+      showLayer(state.front);
+      onArrive();
+      updatePosition();
+      return;
+    }
     const next = state.preload, prev = state.front;
     // 上一次還沒淡完的圖層直接收起來
     const spare = state.fading || state.layers.find((l) => l !== next && l !== prev);
@@ -317,9 +385,8 @@
     state.pending = null;
     state.busy = false;
     state.lastStep = now;
-    P.want = null; P.id = null;
-    if (contextLost(P)) rebuildLayer(P);
-    setStatus('街景載入逾時，重試中…');
+    P.want = null; P.id = null; P.failed = null;
+    setStatus('街景載入失敗，重試中…');
   }
 
   function updatePosition() {
@@ -332,7 +399,7 @@
 
   // 預先載入「接下來最可能走的」那張街景
   function predictNext() {
-    if (state.pending) return;
+    if (state.pending || state.lite) return;
     const dir = state.lastDir === -1 && !state.auto ? -1 : 1;
     const want = dir === 1 ? state.heading : state.heading + 180;
     const r = bestLink(want, state.auto);
@@ -479,10 +546,12 @@
       // 預載層準備好就交叉淡入（逾時也直接換，避免卡住）
       if (state.pending) {
         const P = state.preload;
-        const ready = P.id === state.pending && now - P.readyAt >= TILE_GRACE;
+        const ready = P.id === state.pending && now - P.readyAt >= (state.lite ? 0 : TILE_GRACE);
         if (ready) swap(now);
+        else if (P.failed === state.pending) abortPending(now);
         else if (now - state.busySince > STEP_TIMEOUT) {
-          if (!state.front.id) swap(now);       // 還沒有任何畫面（剛開啟）：照樣顯示
+          if (state.lite) swap(now);            // 單圖層：Google 會保留舊畫面直到新的載好
+          else if (!state.front.id) swap(now);  // 還沒有任何畫面（剛開啟）：照樣顯示
           else abortPending(now);               // 已有畫面：保留目前畫面，不換成黑的
         }
       }
@@ -497,7 +566,7 @@
 
       // 前進時鏡頭持續推近，看起來像一直往前開，而不是一格一格跳
       const dollyRate = DOLLY_ZOOM / (interval / 1000);
-      if (moving === 1) {
+      if (moving === 1 && !state.lite) {
         setZoom(state.front, Math.min(BASE_ZOOM + DOLLY_ZOOM * 1.2, state.front.z + dollyRate * dt));
       } else if (state.front.z !== BASE_ZOOM) {
         const z = state.front.z + (BASE_ZOOM - state.front.z) * ease(moving ? 6 : 1.5, dt);
