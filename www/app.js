@@ -11,6 +11,7 @@
  *  B         小地圖切換 一般/衛星
  *  H         顯示/隱藏操作說明
  *  滑鼠/手指拖曳畫面  轉動視角（左右改變車頭方向、上下看天空/地面）
+ *  滑鼠滾輪          放大/縮小照片
  */
 (() => {
   'use strict';
@@ -53,6 +54,8 @@
   const TILE_GRACE = 220;        // 剛載好資料時多等一下，讓影像圖磚與 Google 自己的過場跑完再淡入
   const DRAG_FOV = 100;          // 拖過整個畫面寬度約轉動的角度
   const MAX_PITCH = 80;
+  const MIN_ZOOM = 0, MAX_ZOOM = 4; // 街景可用的縮放範圍（0 = 180°，4 ≈ 11°）
+  const WHEEL_STEP = 0.0015;     // 滾輪每個像素改變的縮放量
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -73,6 +76,7 @@
     arrivedAt: 0,
     alignTarget: null,        // 道路方向，車頭會慢慢對齊
     keys: new Set(),
+    zoomAdj: 0,               // 使用者用滾輪加上的縮放（log2，正值 = 放大）
     drag: null,               // 滑鼠/觸控拖曳中的指標
     gear: 2,
     lite: false,              // 單圖層模式（裝置 WebGL 記憶體不足時自動切換）
@@ -530,12 +534,12 @@
     f = clamp(f, -2 * D, MAX_FWD * D);
     l = clamp(l, -D, D);
     const k = D / (D - f);
-    const fov = 180 / Math.pow(2, BASE_ZOOM);
+    const fov = 180 / Math.pow(2, clamp(BASE_ZOOM + state.zoomAdj, MIN_ZOOM, MAX_ZOOM));
     const fovP = 2 * Math.atan(Math.tan(fov * D2R / 2) / k) * R2D;
     return {
       heading: norm(state.cam + Math.atan(l / D) * R2D),
       pitch: Math.atan(Math.tan(state.camPitch * D2R) / k) * R2D,
-      zoom: clamp(Math.log2(180 / fovP), 0, 4),
+      zoom: clamp(Math.log2(180 / fovP), MIN_ZOOM, MAX_ZOOM),
     };
   }
 
@@ -791,6 +795,18 @@
   panoEl.addEventListener('pointerup', endDrag, true);
   panoEl.addEventListener('pointercancel', endDrag, true);
   panoEl.addEventListener('lostpointercapture', endDrag, true);
+  // 滑鼠滾輪縮放照片（往上滾放大、往下滾縮小）
+  panoEl.addEventListener('wheel', (e) => {
+    if (!state.panorama) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // deltaMode 1 = 行、2 = 頁，換算成像素
+    const px = e.deltaY * (e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? panoEl.clientHeight : 1);
+    const z = clamp(BASE_ZOOM + state.zoomAdj - px * WHEEL_STEP, MIN_ZOOM, MAX_ZOOM);
+    state.zoomAdj = z - BASE_ZOOM;
+    setStatus(`縮放 ${Math.pow(2, state.zoomAdj).toFixed(1)}×`);
+  }, { capture: true, passive: false });
+
   // 擋掉 Google 街景自己的拖曳處理
   ['mousedown', 'touchstart', 'touchmove'].forEach((t) =>
     panoEl.addEventListener(t, (e) => e.stopPropagation(), { capture: true, passive: true }));
