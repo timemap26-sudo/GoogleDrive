@@ -55,7 +55,7 @@
   const els = {
     layers: [$('panoA'), $('panoB'), $('panoC')], minimap: $('minimap'), minimapWrap: $('minimapWrap'), status: $('status'),
     speed: $('speedValue'), gear: $('gear'), needle: $('needle'), headingText: $('headingText'),
-    help: $('help'), autoBtn: $('autoBtn'),
+    help: $('help'), autoBtn: $('autoBtn'), cruiseBtn: $('cruiseBtn'),
     keyDialog: $('keyDialog'), keyForm: $('keyForm'), keyInput: $('keyInput'),
     searchForm: $('searchForm'), searchInput: $('searchInput'), settingsBtn: $('settingsBtn'),
   };
@@ -75,6 +75,8 @@
     gear: 2,
     lite: false,              // 單圖層模式（裝置 WebGL 記憶體不足時自動切換）
     auto: false,
+    cruise: false,            // 定速巡航：不用按住 ↑ 也會持續前進，方向自己控制
+    brakeHeld: null,          // 按 ↓ 解除巡航時，這顆鍵放開前不當成倒車
     busy: false,
     busySince: 0,
     odo: 0,                   // 離開目前這張照片後「虛擬行駛」的公尺數（定速累積）
@@ -249,7 +251,7 @@
       if (L !== state.front) return;
       const pov = L.pano.getPov();
       if (state.lastPovHeading === null || angleDiff(pov.heading, state.lastPovHeading) > 0.5) {
-        if (!state.keys.size && !state.auto) {
+        if (!state.keys.size && !state.auto && !state.cruise) {
           state.heading = state.cam = norm(pov.heading);
           state.alignTarget = null;
           state.turnVel = 0;
@@ -498,7 +500,7 @@
       state.alignTarget = null;
     }
     const n = (state.panorama.getLinks() || []).length;
-    if (!state.auto && !state.keys.size) setStatus(n ? `路口：${n} 條路可走` : '沒有可行駛的道路');
+    if (!state.auto && !state.cruise && !state.keys.size) setStatus(n ? `路口：${n} 條路可走` : '沒有可行駛的道路');
   }
 
   // 下一張照片離這裡多遠？預載層已經載好就用真實座標算，否則先用預設值
@@ -565,7 +567,7 @@
 
       // 鏡頭平滑跟隨車頭方向；行駛中 pitch 慢慢回正（拖曳中或停車時保留使用者的視角）
       const cd = signedDiff(state.cam, state.heading);
-      const driving = state.auto || k.has('ArrowUp') || k.has('w') || k.has('ArrowDown') || k.has('s');
+      const driving = state.auto || state.cruise || k.has('ArrowUp') || k.has('w') || k.has('ArrowDown') || k.has('s');
       const pitch = state.drag || !driving ? state.camPitch
         : Math.abs(state.camPitch) < 0.05 ? 0 : state.camPitch * (1 - ease(3, dt));
       if (Math.abs(cd) > 0.02 || pitch !== state.camPitch) {
@@ -575,8 +577,8 @@
       }
 
       // 前進 / 倒車：定速累積行駛距離，走滿到下一張照片的距離才換張
-      const fwd = k.has('ArrowUp') || k.has('w') || state.auto;
-      const back = k.has('ArrowDown') || k.has('s');
+      const fwd = k.has('ArrowUp') || k.has('w') || state.auto || state.cruise;
+      const back = (k.has('ArrowDown') && state.brakeHeld !== 'ArrowDown') || (k.has('s') && state.brakeHeld !== 's');
       let moving = 0;
       if (fwd && !back) moving = 1; else if (back && !fwd) moving = -1;
       const speed = moving ? (GEARS[state.gear].kmh / 3.6) * (moving === -1 ? REVERSE_FACTOR : 1) : 0;
@@ -652,9 +654,18 @@
   }
 
   function toggleAuto(on = !state.auto) {
+    if (on && state.cruise) toggleCruise(false, true);
     state.auto = on;
     els.autoBtn.classList.toggle('on', on);
     setStatus(on ? '自動駕駛中（方向鍵可轉彎，空白鍵停止）' : '自動駕駛關閉');
+  }
+
+  // 定速巡航：放開 ↑ 也會用目前檔位的速度持續前進，← → 自己轉彎，↓ 或 C 解除
+  function toggleCruise(on = !state.cruise, quiet = false) {
+    if (on && state.auto) toggleAuto(false);
+    state.cruise = on;
+    els.cruiseBtn.classList.toggle('on', on);
+    if (!quiet) setStatus(on ? `定速巡航 ${GEARS[state.gear].kmh} km/h（← → 轉向，↓ 或 C 解除）` : '定速巡航解除');
   }
 
   // 小地圖放大/還原
@@ -692,13 +703,29 @@
   // ---------- 鍵盤 ----------
   const DRIVE_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 'a', 's', 'd']);
   function keyName(e) { return e.key.length === 1 ? e.key.toLowerCase() : e.key; }
+  // 巡航中踩 ↓ 等於踩煞車：解除巡航並停車，要再按一次才會倒車
+  function pressDrive(k) {
+    if ((k === 'ArrowDown' || k === 's') && state.cruise) {
+      toggleCruise(false);
+      state.brakeHeld = k;
+    }
+    state.keys.add(k);
+  }
+  function releaseDrive(k) {
+    state.keys.delete(k);
+    if (state.brakeHeld === k) state.brakeHeld = null;
+  }
 
   window.addEventListener('keydown', (e) => {
     if (e.target === els.searchInput || e.target === els.keyInput) return;
     const k = keyName(e);
-    if (DRIVE_KEYS.has(k)) { state.keys.add(k); e.preventDefault(); e.stopPropagation(); return; }
+    if (DRIVE_KEYS.has(k)) {
+      if (!e.repeat) pressDrive(k);
+      e.preventDefault(); e.stopPropagation(); return;
+    }
     if (e.repeat) return;
     if (k === ' ') { toggleAuto(); e.preventDefault(); }
+    else if (k === 'c') toggleCruise();
     else if (k === '+' || k === '=') shiftGear(1);
     else if (k === '-' || k === '_') shiftGear(-1);
     else if (k === 'm') els.minimapWrap.classList.toggle('hidden');
@@ -706,8 +733,8 @@
     else if (k === 'b') toggleMapType();
     else if (k === 'h') els.help.classList.toggle('hidden');
   }, true);
-  window.addEventListener('keyup', (e) => { state.keys.delete(keyName(e)); }, true);
-  window.addEventListener('blur', () => state.keys.clear());
+  window.addEventListener('keyup', (e) => releaseDrive(keyName(e)), true);
+  window.addEventListener('blur', () => { state.keys.clear(); state.brakeHeld = null; });
   window.addEventListener('resize', () => { BASE_ZOOM = baseZoom(); });
 
   // ---------- 滑鼠 / 觸控拖曳轉動視角 ----------
@@ -758,10 +785,10 @@
       e.preventDefault();
       btn.setPointerCapture && btn.setPointerCapture(e.pointerId);
       btn.classList.add('active');
-      if (isHold) state.keys.add(key);
+      if (isHold) pressDrive(key);
       else shiftGear(key === '+' ? 1 : -1);
     };
-    const up = () => { btn.classList.remove('active'); if (isHold) state.keys.delete(key); };
+    const up = () => { btn.classList.remove('active'); if (isHold) releaseDrive(key); };
     btn.addEventListener('pointerdown', down);
     btn.addEventListener('pointerup', up);
     btn.addEventListener('pointercancel', up);
@@ -769,6 +796,7 @@
     btn.addEventListener('contextmenu', (e) => e.preventDefault());
   });
   els.autoBtn.addEventListener('click', () => toggleAuto());
+  els.cruiseBtn.addEventListener('click', () => toggleCruise());
 
   // ---------- PWA ----------
   if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
