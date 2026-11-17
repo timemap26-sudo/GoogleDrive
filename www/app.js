@@ -7,6 +7,7 @@
  *  Space     自動駕駛（會自動沿著道路彎道行駛）
  *  + / -     切換速度檔位
  *  M         顯示/隱藏小地圖
+ *  N         放大/縮小小地圖
  *  H         顯示/隱藏操作說明
  */
 (() => {
@@ -36,7 +37,7 @@
 
   const $ = (id) => document.getElementById(id);
   const els = {
-    pano: $('pano'), minimap: $('minimap'), status: $('status'),
+    pano: $('pano'), minimap: $('minimap'), minimapWrap: $('minimapWrap'), status: $('status'),
     speed: $('speedValue'), gear: $('gear'), needle: $('needle'), headingText: $('headingText'),
     help: $('help'), autoBtn: $('autoBtn'),
     keyDialog: $('keyDialog'), keyForm: $('keyForm'), keyInput: $('keyInput'),
@@ -153,6 +154,9 @@
     // 點小地圖可以瞬間移動
     state.map.setOptions({ gestureHandling: 'greedy' });
     state.map.addListener('click', (e) => jumpTo(e.latLng));
+    $('mapExpand').addEventListener('click', toggleMapExpand);
+    $('mapZoomIn').addEventListener('click', () => state.map.setZoom(state.map.getZoom() + 1));
+    $('mapZoomOut').addEventListener('click', () => state.map.setZoom(state.map.getZoom() - 1));
 
     state.panorama.addListener('pano_changed', onArrive);
     state.panorama.addListener('links_changed', onLinks);
@@ -345,6 +349,21 @@
     setStatus(on ? '自動駕駛中（方向鍵可轉彎，空白鍵停止）' : '自動駕駛關閉');
   }
 
+  // 小地圖放大/還原
+  function toggleMapExpand() {
+    const on = els.minimapWrap.classList.toggle('expanded');
+    $('mapExpand').textContent = on ? '⤡' : '⤢';
+    $('mapExpand').title = on ? '縮小地圖 (N)' : '放大地圖 (N)';
+    if (state.map) {
+      state.map.setZoom(on ? Math.max(state.map.getZoom(), 17) : 17);
+      // 等尺寸動畫結束後重新置中
+      setTimeout(() => {
+        const p = state.panorama && state.panorama.getPosition();
+        if (p) state.map.setCenter(p);
+      }, 300);
+    }
+  }
+
   function shiftGear(d) {
     state.gear = Math.max(0, Math.min(GEARS.length - 1, state.gear + d));
     setStatus(`檔位 ${GEARS[state.gear].name}`);
@@ -362,7 +381,8 @@
     if (k === ' ') { toggleAuto(); e.preventDefault(); }
     else if (k === '+' || k === '=') shiftGear(1);
     else if (k === '-' || k === '_') shiftGear(-1);
-    else if (k === 'm') els.minimap.classList.toggle('hidden');
+    else if (k === 'm') els.minimapWrap.classList.toggle('hidden');
+    else if (k === 'n') toggleMapExpand();
     else if (k === 'h') els.help.classList.toggle('hidden');
   }, true);
   window.addEventListener('keyup', (e) => { state.keys.delete(keyName(e)); }, true);
